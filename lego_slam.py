@@ -82,6 +82,29 @@ class LEGO_SLAM(SLAMParameters):
         self.loopclosing_local_correspondence_distance = float(args.loopclosing_local_correspondence_distance)
         self.loop_constraint_noise = float(args.loop_constraint_noise)
         self.loop_closing_start = int(args.loop_closing_start)
+
+        # ---------------------------------------------------------------
+        # SGCO (Semantic-Geometry Co-Optimization) parameters.
+        # Read here so the Mapper (which uses getattr defaults) can pick them
+        # up. Defaults reproduce the original LEGO-SLAM behaviour.
+        # ---------------------------------------------------------------
+        # Innovation 1: direction-aware + confidence-weighted feature loss
+        self.lambda_feat_cos = float(args.lambda_feat_cos)
+        self.feat_conf_weight = bool(args.feat_conf_weight)
+        # Innovation 1b: language-field polarization regularizer
+        self.lambda_sem_contrast = float(args.lambda_sem_contrast)
+        self.sem_contrast_interval = int(args.sem_contrast_interval)
+        self.sem_contrast_sample = int(args.sem_contrast_sample)
+        self.sem_contrast_k = int(args.sem_contrast_k)
+        self.sem_contrast_dist = float(args.sem_contrast_dist)
+        self.sem_contrast_pos = float(args.sem_contrast_pos)
+        self.sem_contrast_margin = float(args.sem_contrast_margin)
+        # Innovation 2: semantic-error-guided adaptive densification
+        self.sem_densify = bool(args.sem_densify)
+        self.sem_densify_interval = int(args.sem_densify_interval)
+        self.sem_densify_from_iter = int(args.sem_densify_from_iter)
+        self.sem_densify_grad_th = float(args.sem_densify_grad_th)
+        self.max_total_gaussians = int(args.max_total_gaussians)
         
         if self.rerun_viewer:
             rr.init("3dgsviewer", spawn=True)
@@ -447,6 +470,40 @@ if __name__ == "__main__":
     parser.add_argument("--loopclosing_local_correspondence_distance", default=0.5)
     parser.add_argument("--loop_constraint_noise", default=1e-3)
     parser.add_argument("--loop_closing_start", default=25)
+
+    ## SGCO (Semantic-Geometry Co-Optimization) Parameters
+    # --- Innovation 1: direction-aware + confidence-weighted feature supervision ---
+    # lambda_feat_cos=0 reproduces the original pure-L1 feature loss.
+    parser.add_argument("--lambda_feat_cos", default=0.0, type=float,
+                        help="weight of the cosine (direction) term added to the semantic-feature loss")
+    parser.add_argument("--feat_conf_weight", action="store_true", default=False,
+                        help="weight the cosine feature term by GT feature confidence (vector norm)")
+    # --- Innovation 1b: language-field polarization regularizer (default off) ---
+    parser.add_argument("--lambda_sem_contrast", default=0.0, type=float,
+                        help="weight of the self-supervised semantic-field polarization regularizer")
+    parser.add_argument("--sem_contrast_interval", default=5, type=int,
+                        help="run the polarization regularizer every N mapping iterations")
+    parser.add_argument("--sem_contrast_sample", default=2048, type=int,
+                        help="number of Gaussians sampled per polarization step")
+    parser.add_argument("--sem_contrast_k", default=8, type=int,
+                        help="number of spatial neighbours per anchor in the polarization regularizer")
+    parser.add_argument("--sem_contrast_dist", default=0.05, type=float,
+                        help="max neighbour distance (m) considered by the polarization regularizer")
+    parser.add_argument("--sem_contrast_pos", default=0.85, type=float,
+                        help="cosine-similarity threshold above which a near pair is pulled together")
+    parser.add_argument("--sem_contrast_margin", default=0.5, type=float,
+                        help="dead-zone margin; near pairs below (pos-margin) are pushed apart")
+    # --- Innovation 2: semantic-error-guided adaptive densification (default off) ---
+    parser.add_argument("--sem_densify", action="store_true", default=False,
+                        help="enable gradient-driven (semantic-error-guided) densification")
+    parser.add_argument("--sem_densify_interval", default=200, type=int,
+                        help="run densification every N mapping iterations")
+    parser.add_argument("--sem_densify_from_iter", default=500, type=int,
+                        help="start densification only after this many mapping iterations")
+    parser.add_argument("--sem_densify_grad_th", default=0.0002, type=float,
+                        help="view-space gradient threshold for clone/split")
+    parser.add_argument("--max_total_gaussians", default=0, type=int,
+                        help="hard cap on the total number of Gaussians (0 = unlimited)")
 
     args = parser.parse_args()
 

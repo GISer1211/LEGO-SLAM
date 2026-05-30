@@ -734,6 +734,96 @@ class GaussianModel(nn.Module):
 
         torch.cuda.empty_cache()
 
+    def _clone_points(self, mask):
+        """Clone selected Gaussians, keeping ALL per-Gaussian bookkeeping
+        (including keyframe_idx, which the stock densify_and_clone omits)."""
+        new_xyz = self._xyz[mask]
+        new_features_dc = self._features_dc[mask]
+        new_features_rest = self._features_rest[mask]
+        new_opacities = self._opacity[mask]
+        new_scaling = self._scaling[mask]
+        new_rotation = self._rotation[mask]
+        new_trackable_mask = self.trackable_mask[mask]
+        new_semantic_feature = self._semantic_feature[mask]
+        new_edge_mask = self.edge_mask[mask]
+        new_keyframe_idx = self.keyframe_idx[mask].clone()
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest,
+                                   new_opacities, new_scaling, new_rotation,
+                                   new_trackable_mask, new_semantic_feature, new_edge_mask)
+        self.keyframe_idx = torch.concat([self.keyframe_idx, new_keyframe_idx], dim=0)
+
+    def _split_points(self, mask, N=2):
+        """Split selected Gaussians, keeping ALL per-Gaussian bookkeeping
+        (including keyframe_idx) consistent."""
+        device = self._xyz.device
+        stds = self.get_scaling[mask].repeat(N, 1)
+        means = torch.zeros((stds.size(0), 3), device=device)
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[mask]).repeat(N, 1, 1)
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[mask].repeat(N, 1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[mask].repeat(N, 1) / (0.8 * N))
+        new_rotation = self._rotation[mask].repeat(N, 1)
+        new_features_dc = self._features_dc[mask].repeat(N, 1, 1)
+        new_features_rest = self._features_rest[mask].repeat(N, 1, 1)
+        new_opacity = self._opacity[mask].repeat(N, 1)
+        new_trackable_mask = self.trackable_mask[mask].repeat(N)
+        new_semantic_feature = self._semantic_feature[mask].repeat(N, 1, 1)
+        new_edge_mask = self.edge_mask[mask].repeat(N)
+        new_keyframe_idx = self.keyframe_idx[mask].repeat(N, 1)
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest,
+                                   new_opacity, new_scaling, new_rotation,
+                                   new_trackable_mask, new_semantic_feature, new_edge_mask)
+        self.keyframe_idx = torch.concat([self.keyframe_idx, new_keyframe_idx], dim=0)
+
+        prune_filter = torch.cat((mask, torch.zeros(N * mask.sum(), device=device, dtype=bool)))
+        self.prune_points(prune_filter)
+
+    def densify_semantic_guided(self, grad_threshold, extent, max_total=0):
+        """Semantic-error-guided adaptive densification (SGCO - Innovation 2).
+
+        Clone under-reconstructed *small* Gaussians and split over-large
+        Gaussians wherever the accumulated view-space gradient is high. Because
+        the training loss now also contains the direction-aware language term,
+        this view-space gradient is *semantically informed*: it grows on
+        photometric AND semantic-boundary error, so new Gaussians are spent
+        exactly where PSNR and IoU are jointly bottlenecked. The original
+        LEGO-SLAM map only ever *adds* depth-projected points and never performs
+        gradient-driven densification, so under-reconstructed / thin / low-depth
+        regions stay coarse.
+
+        Returns the net number of Gaussians added (>=0).
+        """
+        if self.denom.shape[0] != self._xyz.shape[0]:
+            return 0
+
+        grads = self.xyz_gradient_accum / torch.clamp_min(self.denom, 1.0)
+        grads[grads.isnan()] = 0.0
+        grads_norm = torch.norm(grads, dim=-1)
+
+        n_before = self._xyz.shape[0]
+        if max_total and n_before >= max_total:
+            return 0
+
+        # ---- clone: small Gaussians with high gradient ----
+        clone_mask = grads_norm >= grad_threshold
+        if extent is not None:
+            clone_mask = clone_mask & (self.get_scaling.max(dim=1).values <= self.percent_dense * extent)
+        if clone_mask.any():
+            self._clone_points(clone_mask)
+
+        # ---- split: large Gaussians with high gradient ----
+        padded_grad = torch.zeros((self._xyz.shape[0]), device=self._xyz.device)
+        padded_grad[:grads_norm.shape[0]] = grads_norm
+        split_mask = padded_grad >= grad_threshold
+        if extent is not None:
+            split_mask = split_mask & (self.get_scaling.max(dim=1).values > self.percent_dense * extent)
+        if split_mask.any():
+            self._split_points(split_mask, N=2)
+
+        return max(0, self._xyz.shape[0] - n_before)
+
     def prune_large_and_transparent(self, min_opacity, extent):
         
         #torch.cuda.empty_cache()
@@ -825,6 +915,53 @@ class GaussianModel(nn.Module):
         prune_mask = transparent_mask | large_mask | redundant_meaning_mask
         self.prune_points(prune_mask)
 
+
+    def semantic_polarization_loss(self, sample_size=2048, k=8, dist_th=0.05, pos_th=0.85, neg_margin=0.5):
+        """Self-supervised semantic-field polarization (SGCO - Innovation 1b).
+
+        For spatially-near Gaussian pairs, pull already-similar language features
+        closer together and push already-dissimilar ones apart, with a dead-zone
+        in between to avoid trivial collapse. This drives the per-Gaussian
+        language field toward a piecewise-constant layout with crisp object
+        boundaries - exactly the regime that maximises the argmax-based
+        open-vocabulary IoU/Accuracy metric. Only the semantic features receive
+        gradients; geometry is detached.
+        """
+        N = self._xyz.shape[0]
+        if N < (k + 2):
+            return self._xyz.new_zeros(())
+
+        device = self._xyz.device
+        s = min(sample_size, N)
+        idx = torch.randperm(N, device=device)[:s]
+        xyz = self._xyz[idx].detach()                       # geometry detached
+
+        sem = self._semantic_feature
+        sem = sem.reshape(sem.shape[0], -1)                 # [N, D] (keeps grad)
+        sem_s = sem[idx]
+        sem_n = torch.nn.functional.normalize(sem_s, dim=1, eps=1e-8)
+
+        # KNN by Euclidean distance on positions.
+        dist = torch.cdist(xyz, xyz)
+        kk = min(k + 1, s)
+        dists, nn_idx = torch.topk(dist, kk, dim=1, largest=False)
+        dists = dists[:, 1:]                                 # drop self -> [s, k]
+        nn_idx = nn_idx[:, 1:]
+
+        # Cosine similarity between each anchor and its k neighbours.
+        sims = torch.bmm(sem_n.unsqueeze(1), sem_n[nn_idx].transpose(1, 2)).squeeze(1)  # [s, k]
+
+        near = dists < dist_th
+        sims_d = sims.detach()
+        pull_mask = near & (sims_d > pos_th)
+        push_mask = near & (sims_d < (pos_th - neg_margin))
+
+        loss = self._xyz.new_zeros(())
+        if pull_mask.any():
+            loss = loss + (1.0 - sims[pull_mask]).mean()
+        if push_mask.any():
+            loss = loss + torch.relu(sims[push_mask]).mean()
+        return loss
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)

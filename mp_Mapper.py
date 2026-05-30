@@ -202,6 +202,30 @@ class Mapper(SLAMParameters):
         self.n_trackable_keyframes = slam.n_trackable_keyframes
         self.loop_closing_start = slam.loop_closing_start
         self.pose_lr_rate = slam.pose_lr_rate
+
+        # ---------------------------------------------------------------
+        # SGCO (Semantic-Geometry Co-Optimization) knobs.
+        # All default values keep the *original* LEGO-SLAM behaviour when
+        # the corresponding lambda is 0 / flag is False, so every module
+        # can be ablated independently.
+        # ---------------------------------------------------------------
+        # Innovation 1: direction-aware + confidence-weighted feature loss
+        self.lambda_feat_cos = float(getattr(slam, 'lambda_feat_cos', 0.0))
+        self.feat_conf_weight = bool(getattr(slam, 'feat_conf_weight', False))
+        # Innovation 1b: language-codebook contrastive regularization
+        self.lambda_sem_contrast = float(getattr(slam, 'lambda_sem_contrast', 0.0))
+        self.sem_contrast_interval = int(getattr(slam, 'sem_contrast_interval', 5))
+        self.sem_contrast_sample = int(getattr(slam, 'sem_contrast_sample', 2048))
+        self.sem_contrast_k = int(getattr(slam, 'sem_contrast_k', 8))
+        self.sem_contrast_dist = float(getattr(slam, 'sem_contrast_dist', 0.05))
+        self.sem_contrast_pos = float(getattr(slam, 'sem_contrast_pos', 0.85))
+        self.sem_contrast_margin = float(getattr(slam, 'sem_contrast_margin', 0.5))
+        # Innovation 2: semantic-error-guided adaptive densification
+        self.sem_densify = bool(getattr(slam, 'sem_densify', False))
+        self.sem_densify_interval = int(getattr(slam, 'sem_densify_interval', 200))
+        self.sem_densify_from_iter = int(getattr(slam, 'sem_densify_from_iter', 500))
+        self.sem_densify_grad_th = float(getattr(slam, 'sem_densify_grad_th', 0.0002))
+        self.max_total_gaussians = int(getattr(slam, 'max_total_gaussians', 0))  # 0 == unlimited
         
         self.shared_cam = slam.shared_cam
         self.shared_new_points = slam.shared_new_points
@@ -255,7 +279,44 @@ class Mapper(SLAMParameters):
 
     def run(self):
         self.mapping()
-    
+
+    def feature_supervision_loss(self, rendered, gt):
+        """Hybrid semantic-feature supervision (SGCO - Innovation 1).
+
+        The open-vocabulary IoU/Accuracy metric in ``calc_2d_metric`` first
+        L2-normalizes the rendered feature and then takes ``argmax`` of its dot
+        product with CLIP text embeddings, i.e. only the *direction* of each
+        feature vector decides the predicted class. The original loss is a pure
+        L1 (magnitude-oriented) term, which is mis-aligned with that decision
+        rule. We therefore add an explicit cosine (direction) term and,
+        optionally, weight it by the GT feature confidence (vector norm), which
+        emphasises confident, class-defining pixels.
+
+        Returns ``(l1_map, scalar_loss)`` so it is a drop-in replacement for the
+        existing ``l1_loss`` call (the map is still used for visualisation).
+
+        rendered, gt: [C, H, W]
+        """
+        l1_map, l1_mean = l1_loss(rendered, gt)
+        if self.lambda_feat_cos <= 0.0:
+            return l1_map, l1_mean
+
+        # Per-pixel cosine distance over the channel dimension.
+        r = rendered.permute(1, 2, 0)                       # [H, W, C]
+        g = gt.permute(1, 2, 0).to(rendered.dtype)          # [H, W, C]
+        cos_map, _ = cos_loss(r, g)                         # [H, W, 1], masked where gt==0
+
+        if self.feat_conf_weight:
+            with torch.no_grad():
+                w = g.norm(dim=-1, keepdim=True)            # [H, W, 1]
+                w = w / (w.mean() + 1e-8)
+                w = torch.clamp(w, 0.0, 3.0)
+            cos_term = (cos_map * w).sum() / (w.sum() + 1e-8)
+        else:
+            cos_term = cos_map.mean()
+
+        return l1_map, l1_mean + self.lambda_feat_cos * cos_term
+
     def set_downsample_filter_multires( self, downsample_scale):
         # Get sampling idxs
         sample_interval = downsample_scale
@@ -887,7 +948,7 @@ class Mapper(SLAMParameters):
                         if self.train_iter < self.encoder_warmup_iter:
                             # Warming up: only decoder learning
                             # Type 1: 512D decoded feature vs GT (decoder learning) - weight 1.0
-                            Ll1_feature_512d_map, Ll1_feature_512d = l1_loss(semantic_feature, gt_semantic_feature)
+                            Ll1_feature_512d_map, Ll1_feature_512d = self.feature_supervision_loss(semantic_feature, gt_semantic_feature)
                             Ll1_feature = Ll1_feature_512d
                             loss = loss_rgb + 0.1*loss_d + Ll1_feature
                         elif self.is_encoder_period():
@@ -903,17 +964,30 @@ class Mapper(SLAMParameters):
                             # Decoder periods: RGB + Depth + Decoder learning
                             # Type 1: 512D decoded feature vs GT (decoder learning) - weight 1.0
                             # semantic_feature is already decoded to 512D in non-encoder periods
-                            Ll1_feature_512d_map, Ll1_feature_512d = l1_loss(semantic_feature, gt_semantic_feature)
+                            Ll1_feature_512d_map, Ll1_feature_512d = self.feature_supervision_loss(semantic_feature, gt_semantic_feature)
                             Ll1_feature = Ll1_feature_512d
                             loss = loss_rgb + 0.1*loss_d + Ll1_feature
                     else:
                         # Original speedup mode: only decoder learning 
-                        Ll1_feature_map, Ll1_feature = l1_loss(semantic_feature, gt_semantic_feature)
+                        Ll1_feature_map, Ll1_feature = self.feature_supervision_loss(semantic_feature, gt_semantic_feature)
                         loss = loss_rgb + 0.1*loss_d + Ll1_feature
                 else:
                     # Original loss for non-speedup mode
                     Ll1_feature_map, Ll1_feature = l1_loss(semantic_feature, gt_semantic_feature)
                     loss = loss_rgb + 0.1*loss_d + Ll1_feature
+
+                # SGCO Innovation 1b: language-field polarization regularizer.
+                # Only meaningful when the Gaussians themselves are being updated
+                # this iteration (warmup or decoder periods); default off (lambda=0).
+                if (self.lambda_sem_contrast > 0.0
+                        and (self.train_iter % max(1, self.sem_contrast_interval) == 0)
+                        and (self.train_iter < self.encoder_warmup_iter or not self.is_encoder_period())):
+                    loss = loss + self.lambda_sem_contrast * self.gaussians.semantic_polarization_loss(
+                        sample_size=self.sem_contrast_sample,
+                        k=self.sem_contrast_k,
+                        dist_th=self.sem_contrast_dist,
+                        pos_th=self.sem_contrast_pos,
+                        neg_margin=self.sem_contrast_margin)
 
                 del semantic_feature, gt_semantic_feature
 
@@ -927,9 +1001,28 @@ class Mapper(SLAMParameters):
                     distance_filter = filtered_distance < 0.05
                     total_filter = mask * alpha_mask * distance_filter
                     valid_pro = total_filter.sum() / mask.sum()
-                
+
+                    # SGCO Innovation 2: accumulate view-space gradient stats for
+                    # the visible Gaussians (used by semantic-guided densification).
+                    if self.sem_densify:
+                        viewspace_point_tensor = render_pkg["viewspace_points"]
+                        visibility_filter = render_pkg["visibility_filter"]
+                        radii = render_pkg["radii"]
+                        if (viewspace_point_tensor.grad is not None
+                                and visibility_filter.shape[0] == self.gaussians.max_radii2D.shape[0]):
+                            self.gaussians.max_radii2D[visibility_filter] = torch.max(
+                                self.gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                            self.gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
                     if self.train_iter % 200 == 0:
                         self.gaussians.prune_large_transparent_and_lang(0.005, self.prune_th, self.dist_threshold, self.sim_threshold, self.max_sample_size, self.sample_ratio, self.k_nearest)
+
+                    # SGCO Innovation 2: periodic semantic-error-guided densification.
+                    if (self.sem_densify
+                            and self.train_iter > self.sem_densify_from_iter
+                            and self.train_iter % max(1, self.sem_densify_interval) == 0):
+                        self.gaussians.densify_semantic_guided(
+                            self.sem_densify_grad_th, self.scene_extent, self.max_total_gaussians)
 
                     if self.train_iter < self.encoder_warmup_iter or not self.is_encoder_period():
                         # Warming up OR Decoder periods: Update Gaussians with RGB+Depth+Decoder loss
