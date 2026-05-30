@@ -81,6 +81,17 @@ class LEGO_SLAM(SLAMParameters):
         self.feature_smooth_interval = int(args.feature_smooth_interval)
         self.feature_smooth_sigma_x = float(args.feature_smooth_sigma_x)
         self.feature_smooth_sigma_c = float(args.feature_smooth_sigma_c)
+
+        # B1: language-boundary + joint-error guided densification
+        self.use_lang_densify = int(args.use_lang_densify)
+        self.densify_interval = int(args.densify_interval)
+        self.max_densify_points = int(args.max_densify_points)
+        self.densify_max_gaussians = int(args.densify_max_gaussians)
+        self.densify_color_err_th = float(args.densify_color_err_th)
+        self.densify_alpha_th = float(args.densify_alpha_th)
+        self.densify_depth_err_th = float(args.densify_depth_err_th)
+        self.densify_boundary_th = float(args.densify_boundary_th)
+        self.lambda_densify_boundary = float(args.lambda_densify_boundary)
         # self.system_fps_limit = float(args.system_fps_limit) if hasattr(args, 'system_fps_limit') else 20.0
         self.system_fps_limit = float(args.system_fps_limit)
         self.pretrained_encoder_path = args.pretrained_encoder_path
@@ -457,6 +468,17 @@ if __name__ == "__main__":
     parser.add_argument("--feature_smooth_interval", type=int, default=5, help="A3: apply the regularizer every N training iterations")
     parser.add_argument("--feature_smooth_sigma_x", type=float, default=0.1, help="A3: spatial bandwidth of the bilateral weight")
     parser.add_argument("--feature_smooth_sigma_c", type=float, default=0.2, help="A3: color bandwidth of the bilateral weight")
+
+    ## B1: language-boundary + joint-error guided online densification
+    parser.add_argument("--use_lang_densify", type=int, default=1, help="B1: enable language/error-guided online densification (1: on, 0: off)")
+    parser.add_argument("--densify_interval", type=int, default=20, help="B1: run densification every N training iterations")
+    parser.add_argument("--max_densify_points", type=int, default=8000, help="B1: max Gaussians inserted per densification event")
+    parser.add_argument("--densify_max_gaussians", type=int, default=3000000, help="B1: global cap; skip densification above this many Gaussians")
+    parser.add_argument("--densify_color_err_th", type=float, default=0.08, help="B1: photometric error threshold for candidate pixels")
+    parser.add_argument("--densify_alpha_th", type=float, default=0.6, help="B1: rendered-alpha threshold below which a pixel is under-reconstructed")
+    parser.add_argument("--densify_depth_err_th", type=float, default=0.05, help="B1: depth residual threshold (m) for candidate pixels")
+    parser.add_argument("--densify_boundary_th", type=float, default=0.5, help="B1: normalized language-boundary threshold for candidate pixels")
+    parser.add_argument("--lambda_densify_boundary", type=float, default=1.0, help="B1: weight of the language boundary in the candidate ranking score")
 
     ## Loop Closing Parameters
     parser.add_argument("--enable_loop_closing", action="store_true", default=False, help="enable loop closing (default: False)")

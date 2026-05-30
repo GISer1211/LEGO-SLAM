@@ -242,6 +242,62 @@ class GaussianModel(nn.Module):
         torch.cuda.empty_cache()
 
 
+    def add_densified_gaussians(self, new_points, new_colors, new_semantic_feature,
+                                new_z_values, keyframe_idx, pixel_scale, speedup=True):
+        """Insert new Gaussians produced by language-boundary / error-guided
+        densification (B1).
+
+        New Gaussians are back-projected image points: opacity is initialised low
+        (0.1), rotation is identity, and the scale is isotropic and proportional
+        to the metric pixel footprint at the point depth (z * pixel_scale, with
+        pixel_scale = 1/fx). The semantic feature is expected to already be in the
+        per-Gaussian dimensionality (i.e. encoded to 16-D by the caller in speedup
+        mode). ``keyframe_idx`` is propagated so loop closure transforms these
+        points together with their source keyframe.
+
+        Returns the number of Gaussians actually added.
+        """
+        M = new_points.shape[0]
+        if M == 0:
+            return 0
+
+        fused_color = RGB2SH(new_colors)
+        features = torch.zeros((M, 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        raw_scale = (new_z_values.float() * pixel_scale).clamp_min(1e-6).unsqueeze(-1).repeat(1, 3)
+        scales = torch.log(raw_scale)
+
+        rots = torch.zeros((M, 4), dtype=torch.float, device="cuda")
+        rots[:, 0] = 1.0  # identity quaternion (w, x, y, z)
+
+        opacities = inverse_sigmoid(0.1 * torch.ones((M, 1), dtype=torch.float, device="cuda"))
+
+        new_xyz = nn.Parameter(new_points.float().contiguous().requires_grad_(True))
+        new_features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        new_features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+        new_scaling = nn.Parameter(scales.requires_grad_(True))
+        new_rotation = nn.Parameter(rots.requires_grad_(True))
+        new_opacities = nn.Parameter(opacities.requires_grad_(True))
+        new_semantic_feature = nn.Parameter(
+            new_semantic_feature.float().unsqueeze(1).contiguous().requires_grad_(True))
+
+        new_trackable_mask = torch.zeros((M,), dtype=torch.bool, device="cuda")
+        new_edge_mask = torch.zeros((M,), dtype=torch.bool, device="cuda")
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest,
+                                   new_opacities, new_scaling, new_rotation,
+                                   new_trackable_mask, new_semantic_feature, new_edge_mask)
+
+        # keep keyframe_idx in sync (densification_postfix does not touch it)
+        new_keyframe_idx = torch.ones((M, self.keyframe_idx.shape[1]),
+                                      device="cuda", dtype=torch.int32) * keyframe_idx
+        self.keyframe_idx = torch.concat([self.keyframe_idx, new_keyframe_idx], dim=0)
+
+        torch.cuda.empty_cache()
+        return M
+
     def get_trackable_gaussians_tensor(self, opacity_th, trackable_kf_idx):
         with torch.no_grad():
             opacity_filter = self.get_opacity > opacity_th
