@@ -242,6 +242,62 @@ class GaussianModel(nn.Module):
         torch.cuda.empty_cache()
 
 
+    def add_densified_gaussians(self, new_points, new_colors, new_semantic_feature,
+                                new_z_values, keyframe_idx, pixel_scale, speedup=True):
+        """Insert new Gaussians produced by language-boundary / error-guided
+        densification (B1).
+
+        New Gaussians are back-projected image points: opacity is initialised low
+        (0.1), rotation is identity, and the scale is isotropic and proportional
+        to the metric pixel footprint at the point depth (z * pixel_scale, with
+        pixel_scale = 1/fx). The semantic feature is expected to already be in the
+        per-Gaussian dimensionality (i.e. encoded to 16-D by the caller in speedup
+        mode). ``keyframe_idx`` is propagated so loop closure transforms these
+        points together with their source keyframe.
+
+        Returns the number of Gaussians actually added.
+        """
+        M = new_points.shape[0]
+        if M == 0:
+            return 0
+
+        fused_color = RGB2SH(new_colors)
+        features = torch.zeros((M, 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        raw_scale = (new_z_values.float() * pixel_scale).clamp_min(1e-6).unsqueeze(-1).repeat(1, 3)
+        scales = torch.log(raw_scale)
+
+        rots = torch.zeros((M, 4), dtype=torch.float, device="cuda")
+        rots[:, 0] = 1.0  # identity quaternion (w, x, y, z)
+
+        opacities = inverse_sigmoid(0.1 * torch.ones((M, 1), dtype=torch.float, device="cuda"))
+
+        new_xyz = nn.Parameter(new_points.float().contiguous().requires_grad_(True))
+        new_features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        new_features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+        new_scaling = nn.Parameter(scales.requires_grad_(True))
+        new_rotation = nn.Parameter(rots.requires_grad_(True))
+        new_opacities = nn.Parameter(opacities.requires_grad_(True))
+        new_semantic_feature = nn.Parameter(
+            new_semantic_feature.float().unsqueeze(1).contiguous().requires_grad_(True))
+
+        new_trackable_mask = torch.zeros((M,), dtype=torch.bool, device="cuda")
+        new_edge_mask = torch.zeros((M,), dtype=torch.bool, device="cuda")
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest,
+                                   new_opacities, new_scaling, new_rotation,
+                                   new_trackable_mask, new_semantic_feature, new_edge_mask)
+
+        # keep keyframe_idx in sync (densification_postfix does not touch it)
+        new_keyframe_idx = torch.ones((M, self.keyframe_idx.shape[1]),
+                                      device="cuda", dtype=torch.int32) * keyframe_idx
+        self.keyframe_idx = torch.concat([self.keyframe_idx, new_keyframe_idx], dim=0)
+
+        torch.cuda.empty_cache()
+        return M
+
     def get_trackable_gaussians_tensor(self, opacity_th, trackable_kf_idx):
         with torch.no_grad():
             opacity_filter = self.get_opacity > opacity_th
@@ -824,6 +880,63 @@ class GaussianModel(nn.Module):
         # ------------ Combine & prune ----------
         prune_mask = transparent_mask | large_mask | redundant_meaning_mask
         self.prune_points(prune_mask)
+
+
+    def lang_feature_smoothness_loss(self, sample_size=2000, k_nearest=8,
+                                     sigma_x=0.1, sigma_c=0.2, eps=1e-8):
+        """Bilateral kNN language-feature smoothness regularizer (A3).
+
+        Encourages Gaussians that are close in 3D space AND similar in color to
+        share similar language features, denoising the 3D language field.
+        Geometry and color are detached so this term only shapes the per-Gaussian
+        semantic features (which carry gradients here).
+
+        Returns a scalar loss (zero tensor if there are too few Gaussians).
+        """
+        import torch
+        import torch.nn.functional as F
+
+        N = self._xyz.shape[0]
+        if N < (k_nearest + 2):
+            return self._xyz.new_zeros(())
+
+        device = self._xyz.device
+        if N > sample_size:
+            sample_indices = torch.randperm(N, device=device)[:sample_size]
+        else:
+            sample_indices = torch.arange(N, device=device)
+        S = sample_indices.shape[0]
+
+        # geometry / appearance used only to build affinity weights -> detached
+        xyz = self.get_xyz[sample_indices].detach()                       # (S, 3)
+        color = self._features_dc[sample_indices].detach().reshape(S, -1)  # (S, 3)
+
+        # per-Gaussian language feature (keep gradient)
+        sem = self._semantic_feature[sample_indices]
+        if sem.ndim == 3:
+            sem = sem.reshape(S, -1)
+        sem_n = F.normalize(sem, dim=1, eps=eps)                          # (S, D)
+
+        # kNN in 3D space
+        dist_mat = torch.cdist(xyz, xyz, p=2)                             # (S, S)
+        dists, nn_idx = torch.topk(dist_mat, k=k_nearest + 1, dim=1, largest=False)
+        dists = dists[:, 1:]                                              # (S, k)
+        nn_idx = nn_idx[:, 1:]                                            # (S, k)
+
+        # bilateral affinity: close in space AND similar in color
+        color_nn = color[nn_idx]                                         # (S, k, 3)
+        color_diff = (color.unsqueeze(1) - color_nn).pow(2).sum(dim=2)    # (S, k)
+        w_spatial = torch.exp(-(dists ** 2) / (sigma_x ** 2 + eps))
+        w_color = torch.exp(-color_diff / (sigma_c ** 2 + eps))
+        w = (w_spatial * w_color).detach()                               # (S, k)
+
+        # cosine dissimilarity between each sample and its neighbours
+        sem_nn = sem_n[nn_idx]                                           # (S, k, D)
+        cos_sim = (sem_n.unsqueeze(1) * sem_nn).sum(dim=2)                # (S, k)
+        diss = 1.0 - cos_sim                                             # (S, k)
+
+        loss = (w * diss).sum() / w.sum().clamp_min(eps)
+        return loss
 
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):

@@ -67,6 +67,31 @@ class LEGO_SLAM(SLAMParameters):
         self.max_sample_size = int(args.max_sample_size)
         self.sample_ratio = float(args.sample_ratio)
         self.k_nearest = int(args.k_nearest)
+
+        # Semantic enhancement (A1/A2/A3)
+        self.use_clip_aligned_loss = int(args.use_clip_aligned_loss)
+        self.lambda_feature_cos = float(args.lambda_feature_cos)
+        self.use_uncertainty_weight = int(args.use_uncertainty_weight)
+        self.uncertainty_tau = float(args.uncertainty_tau)
+        self.uncertainty_min_weight = float(args.uncertainty_min_weight)
+        self.use_feature_smooth = int(args.use_feature_smooth)
+        self.lambda_feature_smooth = float(args.lambda_feature_smooth)
+        self.feature_smooth_sample = int(args.feature_smooth_sample)
+        self.feature_smooth_k = int(args.feature_smooth_k)
+        self.feature_smooth_interval = int(args.feature_smooth_interval)
+        self.feature_smooth_sigma_x = float(args.feature_smooth_sigma_x)
+        self.feature_smooth_sigma_c = float(args.feature_smooth_sigma_c)
+
+        # B1: language-boundary + joint-error guided densification
+        self.use_lang_densify = int(args.use_lang_densify)
+        self.densify_interval = int(args.densify_interval)
+        self.max_densify_points = int(args.max_densify_points)
+        self.densify_max_gaussians = int(args.densify_max_gaussians)
+        self.densify_color_err_th = float(args.densify_color_err_th)
+        self.densify_alpha_th = float(args.densify_alpha_th)
+        self.densify_depth_err_th = float(args.densify_depth_err_th)
+        self.densify_boundary_th = float(args.densify_boundary_th)
+        self.lambda_densify_boundary = float(args.lambda_densify_boundary)
         # self.system_fps_limit = float(args.system_fps_limit) if hasattr(args, 'system_fps_limit') else 20.0
         self.system_fps_limit = float(args.system_fps_limit)
         self.pretrained_encoder_path = args.pretrained_encoder_path
@@ -429,7 +454,32 @@ if __name__ == "__main__":
     parser.add_argument("--max_sample_size", default=3000, type=int, help="maximum sample size for language-based pruning")
     parser.add_argument("--sample_ratio", default=0.1, type=float, help="sample ratio for language-based pruning")
     parser.add_argument("--k_nearest", default=100, type=int, help="k nearest neighbors for language-based pruning")
-    
+
+    ## Semantic enhancement parameters (A1: CLIP-aligned loss, A2: uncertainty weighting, A3: feature smoothness)
+    parser.add_argument("--use_clip_aligned_loss", type=int, default=1, help="A1: add CLIP-aligned cosine term to the language feature loss (1: on, 0: off)")
+    parser.add_argument("--lambda_feature_cos", type=float, default=0.5, help="A1: weight of the cosine term in the feature loss")
+    parser.add_argument("--use_uncertainty_weight", type=int, default=1, help="A2: down-weight ambiguous pixels via codebook entropy (needs loop-closure codebook) (1: on, 0: off)")
+    parser.add_argument("--uncertainty_tau", type=float, default=0.1, help="A2: softmax temperature over codebook similarities")
+    parser.add_argument("--uncertainty_min_weight", type=float, default=0.1, help="A2: lower bound on per-pixel weight")
+    parser.add_argument("--use_feature_smooth", type=int, default=1, help="A3: bilateral kNN feature smoothness regularizer (1: on, 0: off)")
+    parser.add_argument("--lambda_feature_smooth", type=float, default=0.05, help="A3: weight of the feature smoothness regularizer")
+    parser.add_argument("--feature_smooth_sample", type=int, default=2000, help="A3: number of Gaussians sampled per smoothness step")
+    parser.add_argument("--feature_smooth_k", type=int, default=8, help="A3: number of nearest neighbors")
+    parser.add_argument("--feature_smooth_interval", type=int, default=5, help="A3: apply the regularizer every N training iterations")
+    parser.add_argument("--feature_smooth_sigma_x", type=float, default=0.1, help="A3: spatial bandwidth of the bilateral weight")
+    parser.add_argument("--feature_smooth_sigma_c", type=float, default=0.2, help="A3: color bandwidth of the bilateral weight")
+
+    ## B1: language-boundary + joint-error guided online densification
+    parser.add_argument("--use_lang_densify", type=int, default=1, help="B1: enable language/error-guided online densification (1: on, 0: off)")
+    parser.add_argument("--densify_interval", type=int, default=20, help="B1: run densification every N training iterations")
+    parser.add_argument("--max_densify_points", type=int, default=8000, help="B1: max Gaussians inserted per densification event")
+    parser.add_argument("--densify_max_gaussians", type=int, default=3000000, help="B1: global cap; skip densification above this many Gaussians")
+    parser.add_argument("--densify_color_err_th", type=float, default=0.08, help="B1: photometric error threshold for candidate pixels")
+    parser.add_argument("--densify_alpha_th", type=float, default=0.6, help="B1: rendered-alpha threshold below which a pixel is under-reconstructed")
+    parser.add_argument("--densify_depth_err_th", type=float, default=0.05, help="B1: depth residual threshold (m) for candidate pixels")
+    parser.add_argument("--densify_boundary_th", type=float, default=0.5, help="B1: normalized language-boundary threshold for candidate pixels")
+    parser.add_argument("--lambda_densify_boundary", type=float, default=1.0, help="B1: weight of the language boundary in the candidate ranking score")
+
     ## Loop Closing Parameters
     parser.add_argument("--enable_loop_closing", action="store_true", default=False, help="enable loop closing (default: False)")
     ## Network Parameters
