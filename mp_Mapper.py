@@ -14,6 +14,7 @@ sys.path.append(os.path.dirname(__file__))
 from arguments import SLAMParameters
 from utils.traj_utils import TrajManager
 from utils.loss_utils import l1_loss, ssim, cos_loss
+from utils.semantic_enhance import feature_distillation_loss, codebook_confidence_weight
 import encoding.utils as utils
 from encoding.models.sseg import BaseNet
 from scene import GaussianModel
@@ -66,6 +67,23 @@ class Mapper(SLAMParameters):
         self.max_sample_size = slam.max_sample_size
         self.sample_ratio = slam.sample_ratio
         self.k_nearest = slam.k_nearest
+
+        # ---- Semantic enhancement (A1/A2/A3) configuration ----
+        # A1: CLIP-aligned (cosine) feature distillation loss
+        self.use_clip_aligned_loss = bool(int(getattr(slam, 'use_clip_aligned_loss', 1)))
+        self.lambda_feature_cos = float(getattr(slam, 'lambda_feature_cos', 0.5))
+        # A2: semantic uncertainty weighting (needs the loop-closure codebook)
+        self.use_uncertainty_weight = bool(int(getattr(slam, 'use_uncertainty_weight', 1)))
+        self.uncertainty_tau = float(getattr(slam, 'uncertainty_tau', 0.1))
+        self.uncertainty_min_weight = float(getattr(slam, 'uncertainty_min_weight', 0.1))
+        # A3: bilateral kNN feature smoothness regularizer
+        self.use_feature_smooth = bool(int(getattr(slam, 'use_feature_smooth', 1)))
+        self.lambda_feature_smooth = float(getattr(slam, 'lambda_feature_smooth', 0.05))
+        self.feature_smooth_sample = int(getattr(slam, 'feature_smooth_sample', 2000))
+        self.feature_smooth_k = int(getattr(slam, 'feature_smooth_k', 8))
+        self.feature_smooth_interval = int(getattr(slam, 'feature_smooth_interval', 5))
+        self.feature_smooth_sigma_x = float(getattr(slam, 'feature_smooth_sigma_x', 0.1))
+        self.feature_smooth_sigma_c = float(getattr(slam, 'feature_smooth_sigma_c', 0.2))
         self.pretrained_encoder_path = slam.pretrained_encoder_path
         self.pretrained_decoder_path = slam.pretrained_decoder_path
         self.encoder_flag = slam.encoder_flag
@@ -385,6 +403,31 @@ class Mapper(SLAMParameters):
         
         return histogram
     
+    def compute_feature_loss(self, rendered_feature, gt_feature):
+        """512-D language-feature distillation loss.
+
+        Combines the original L1 term with a CLIP-aligned cosine term (A1) and an
+        optional per-pixel uncertainty weighting derived from codebook entropy
+        (A2). Falls back to the exact original L1 loss when both A1 and A2 are
+        disabled, so the baseline remains bit-reproducible for ablations.
+        """
+        if not self.use_clip_aligned_loss and not self.use_uncertainty_weight:
+            _, l1_mean = l1_loss(rendered_feature, gt_feature)
+            return l1_mean
+
+        weight_map = None
+        if self.use_uncertainty_weight and self.vocabulary is not None:
+            if self.vocabulary_gpu is None:
+                self.vocabulary_gpu = torch.from_numpy(self.vocabulary).float().cuda()
+            weight_map = codebook_confidence_weight(
+                gt_feature, self.vocabulary_gpu,
+                tau=self.uncertainty_tau, min_weight=self.uncertainty_min_weight)
+
+        lambda_cos = self.lambda_feature_cos if self.use_clip_aligned_loss else 0.0
+        loss_feat, _ = feature_distillation_loss(
+            rendered_feature, gt_feature, weight_map=weight_map, lambda_cos=lambda_cos)
+        return loss_feat
+
     def log_module_norms(self, module, name, prefix):
         """Check model training"""
         param_vec = nn.utils.parameters_to_vector(module.parameters())
@@ -881,39 +924,38 @@ class Mapper(SLAMParameters):
                 loss_rgb = (1.0 - self.lambda_dssim) * Ll1 + self.lambda_dssim * (1.0 - L_ssim)
                 loss_d = Ll1_d
                 
-                # Feature loss calculation based on encoder_flag
-                if self.speedup:
-                    if self.encoder_flag == 1:
-                        if self.train_iter < self.encoder_warmup_iter:
-                            # Warming up: only decoder learning
-                            # Type 1: 512D decoded feature vs GT (decoder learning) - weight 1.0
-                            Ll1_feature_512d_map, Ll1_feature_512d = l1_loss(semantic_feature, gt_semantic_feature)
-                            Ll1_feature = Ll1_feature_512d
-                            loss = loss_rgb + 0.1*loss_d + Ll1_feature
-                        elif self.is_encoder_period():
-                            # Encoder-only periods
-                            # Type 2: 16D encoded GT vs rendered 16D (encoder learning) - weight 1.0
-                            # Convert GT to float32 and batch processing: [512,H,W] -> [1,512,H,W] -> [1,16,H,W] -> [16,H,W]
-                            gt_batch = gt_semantic_feature.float().unsqueeze(0)  # [1, 512, H, W] (convert to float32)
-                            gt_encoded_batch = self.cnn_encoder(gt_batch)        # Single conv operation!
-                            gt_semantic_encoded = gt_encoded_batch.squeeze(0)    # [16, H, W] (float32)
-                            Ll1_feature_16d_map, Ll1_feature_16d = l1_loss(semantic_feature_16d, gt_semantic_encoded)
-                            loss = Ll1_feature_16d
-                        else:
-                            # Decoder periods: RGB + Depth + Decoder learning
-                            # Type 1: 512D decoded feature vs GT (decoder learning) - weight 1.0
-                            # semantic_feature is already decoded to 512D in non-encoder periods
-                            Ll1_feature_512d_map, Ll1_feature_512d = l1_loss(semantic_feature, gt_semantic_feature)
-                            Ll1_feature = Ll1_feature_512d
-                            loss = loss_rgb + 0.1*loss_d + Ll1_feature
-                    else:
-                        # Original speedup mode: only decoder learning 
-                        Ll1_feature_map, Ll1_feature = l1_loss(semantic_feature, gt_semantic_feature)
-                        loss = loss_rgb + 0.1*loss_d + Ll1_feature
+                # Feature loss calculation based on encoder_flag.
+                # An "encoder-only step" trains the 16-D encoder against the 16-D
+                # rendered feature; every other step performs 512-D language
+                # distillation together with RGB + depth and updates the map.
+                encoder_only_step = (
+                    self.speedup and self.encoder_flag == 1
+                    and self.train_iter >= self.encoder_warmup_iter
+                    and self.is_encoder_period()
+                )
+
+                if encoder_only_step:
+                    # Encoder-only periods: 16D encoded GT vs rendered 16D (encoder learning)
+                    gt_batch = gt_semantic_feature.float().unsqueeze(0)  # [1, 512, H, W]
+                    gt_encoded_batch = self.cnn_encoder(gt_batch)        # Single conv operation!
+                    gt_semantic_encoded = gt_encoded_batch.squeeze(0)    # [16, H, W]
+                    Ll1_feature_16d_map, Ll1_feature_16d = l1_loss(semantic_feature_16d, gt_semantic_encoded)
+                    loss = Ll1_feature_16d
                 else:
-                    # Original loss for non-speedup mode
-                    Ll1_feature_map, Ll1_feature = l1_loss(semantic_feature, gt_semantic_feature)
-                    loss = loss_rgb + 0.1*loss_d + Ll1_feature
+                    # 512-D distillation (decoder period / original speedup / non-speedup):
+                    # CLIP-aligned cosine + L1 (A1) with optional uncertainty weighting (A2).
+                    Ll1_feature = self.compute_feature_loss(semantic_feature, gt_semantic_feature)
+                    loss = loss_rgb + 0.1 * loss_d + Ll1_feature
+
+                    # A3: geometry/appearance-consistent feature smoothness regularizer.
+                    # Computed periodically to keep the online budget bounded.
+                    if (self.use_feature_smooth and self.lambda_feature_smooth > 0.0
+                            and self.train_iter % max(1, self.feature_smooth_interval) == 0):
+                        loss = loss + self.lambda_feature_smooth * self.gaussians.lang_feature_smoothness_loss(
+                            sample_size=self.feature_smooth_sample,
+                            k_nearest=self.feature_smooth_k,
+                            sigma_x=self.feature_smooth_sigma_x,
+                            sigma_c=self.feature_smooth_sigma_c)
 
                 del semantic_feature, gt_semantic_feature
 

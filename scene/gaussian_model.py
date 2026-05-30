@@ -826,6 +826,63 @@ class GaussianModel(nn.Module):
         self.prune_points(prune_mask)
 
 
+    def lang_feature_smoothness_loss(self, sample_size=2000, k_nearest=8,
+                                     sigma_x=0.1, sigma_c=0.2, eps=1e-8):
+        """Bilateral kNN language-feature smoothness regularizer (A3).
+
+        Encourages Gaussians that are close in 3D space AND similar in color to
+        share similar language features, denoising the 3D language field.
+        Geometry and color are detached so this term only shapes the per-Gaussian
+        semantic features (which carry gradients here).
+
+        Returns a scalar loss (zero tensor if there are too few Gaussians).
+        """
+        import torch
+        import torch.nn.functional as F
+
+        N = self._xyz.shape[0]
+        if N < (k_nearest + 2):
+            return self._xyz.new_zeros(())
+
+        device = self._xyz.device
+        if N > sample_size:
+            sample_indices = torch.randperm(N, device=device)[:sample_size]
+        else:
+            sample_indices = torch.arange(N, device=device)
+        S = sample_indices.shape[0]
+
+        # geometry / appearance used only to build affinity weights -> detached
+        xyz = self.get_xyz[sample_indices].detach()                       # (S, 3)
+        color = self._features_dc[sample_indices].detach().reshape(S, -1)  # (S, 3)
+
+        # per-Gaussian language feature (keep gradient)
+        sem = self._semantic_feature[sample_indices]
+        if sem.ndim == 3:
+            sem = sem.reshape(S, -1)
+        sem_n = F.normalize(sem, dim=1, eps=eps)                          # (S, D)
+
+        # kNN in 3D space
+        dist_mat = torch.cdist(xyz, xyz, p=2)                             # (S, S)
+        dists, nn_idx = torch.topk(dist_mat, k=k_nearest + 1, dim=1, largest=False)
+        dists = dists[:, 1:]                                              # (S, k)
+        nn_idx = nn_idx[:, 1:]                                            # (S, k)
+
+        # bilateral affinity: close in space AND similar in color
+        color_nn = color[nn_idx]                                         # (S, k, 3)
+        color_diff = (color.unsqueeze(1) - color_nn).pow(2).sum(dim=2)    # (S, k)
+        w_spatial = torch.exp(-(dists ** 2) / (sigma_x ** 2 + eps))
+        w_color = torch.exp(-color_diff / (sigma_c ** 2 + eps))
+        w = (w_spatial * w_color).detach()                               # (S, k)
+
+        # cosine dissimilarity between each sample and its neighbours
+        sem_nn = sem_n[nn_idx]                                           # (S, k, D)
+        cos_sim = (sem_n.unsqueeze(1) * sem_nn).sum(dim=2)                # (S, k)
+        diss = 1.0 - cos_sim                                             # (S, k)
+
+        loss = (w * diss).sum() / w.sum().clamp_min(eps)
+        return loss
+
+
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
